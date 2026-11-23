@@ -1,12 +1,17 @@
 # Build Tuwunel from the commit pinned in mirror.toml, mirror its source, sign everything with the FreeSynergy release key
 # (existing secrets GPG_PRIVATE_KEY / GPG_PASSPHRASE, used only by fs-release's sign-files action) and create a DRAFT release.
 # Never publishes. Runs only by hand (workflow_dispatch).
+# Gate: first job; needs the required input reviewed_head = github.sha and green check + secrets-scan at that commit (protects against oversight, not against someone who can change workflow, toolchain or scripts).
 # Two jobs: `build` runs foreign build code WITHOUT secrets and with read-only rights; `sign` has the secrets and the write rights but runs
 # no foreign code, only fs-release actions pinned by commit SHA and the checked-in verify script.
 name: mirror
 on:
   workflow_dispatch:
     inputs:
+      reviewed_head:
+        description: "REQUIRED: the full commit hash that was reviewed (Opus YES); the gate aborts unless it is exactly github.sha"
+        type: string
+        required: true
       draft_release:
         description: "Also create the DRAFT GitHub release (never public; a person publishes it)"
         type: boolean
@@ -18,7 +23,37 @@ on:
 permissions:
   contents: read
 jobs:
+  # Gate (first job, `build` needs it): protects against OVERSIGHT, not against someone who can change this workflow, the toolchain or the scripts.
+  # Aborts unless reviewed_head is exactly the commit this run was started on, and `check` and `gitleaks` (workflow secrets-scan) are green at that commit.
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - name: reviewed_head must be exactly this commit, and check and secrets-scan must be green at it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REVIEWED: ${{ inputs.reviewed_head }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          echo "reviewed_head=$REVIEWED github.sha=$SHA"
+          test -n "$REVIEWED" || { echo "::error::gate: reviewed_head is empty"; exit 1; }
+          test "$REVIEWED" = "$SHA" || { echo "::error::gate: reviewed_head is not exactly github.sha (a changed head needs a new review)"; exit 1; }
+          runs=$(gh api --paginate "repos/$REPO/commits/$SHA/check-runs?per_page=100" --jq '.check_runs[] | [.name,.status,.conclusion] | @tsv')
+          printf '%s\n' "$runs"
+          for n in check gitleaks; do
+            mine=$(printf '%s\n' "$runs" | awk -F'\t' -v n="$n" '$1==n')
+            test -n "$mine" || { echo "::error::gate: no check run '$n' at $SHA"; exit 1; }
+            bad=$(printf '%s\n' "$mine" | awk -F'\t' '!($2=="completed" && $3=="success")')
+            test -z "$bad" || { echo "::error::gate: '$n' is not green at $SHA"; exit 1; }
+          done
+          echo "gate green: reviewed_head = github.sha, check and gitleaks green"
   build:
+    needs: gate
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     permissions:
